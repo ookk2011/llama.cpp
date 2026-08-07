@@ -1,104 +1,75 @@
-name: CI (cann)
+name: Build llama-prism Windows CUDA
 
 on:
   workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-cann.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-cann.yml',
-      'ggml/src/ggml-cann/**'
-    ]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
-  cancel-in-progress: true
-
-env:
-  GGML_NLOOP: 3
-  GGML_N_THREADS: 1
-  LLAMA_ARG_LOG_COLORS: 1
-  LLAMA_ARG_LOG_PREFIX: 1
-  LLAMA_ARG_LOG_TIMESTAMPS: 1
+    inputs:
+      build_type:
+        description: 'Build type (Release/Debug)'
+        required: true
+        default: 'Release'
+      cuda_arch:
+        description: 'CUDA Architecture (e.g., 120)'
+        required: true
+        default: '120'
 
 jobs:
-# TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
-#       in order to enable it again, we have to provision dedicated runners  to run it
-#  openEuler-latest-cann:
-#    defaults:
-#      run:
-#        shell: bash -el {0}
-#    strategy:
-#      matrix:
-#        arch: [x86, aarch64]
-#        chip_type: ['910b', '310p']
-#        build: ['Release']
-#        use_acl_graph: ['on', 'off']
-#        exclude:
-#          # 310P does not support USE_ACL_GRAPH=on
-#          - chip_type: '310p'
-#            use_acl_graph: 'on'
-#    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-#    steps:
-#      - name: Checkout
-#        uses: actions/checkout@v6
-#        with:
-#          fetch-depth: 0
-#
-#      - name: Free up disk space
-#        uses: ggml-org/free-disk-space@v1.3.1
-#        with:
-#          tool-cache: true
-#
-#      - name: Set container image
-#        id: cann-image
-#        run: |
-#          image="ascendai/cann:${{ matrix.chip_type == '910b' &&  '8.5.0-910b-openeuler24.03-py3.11' || '8.5.0-310p-openeuler24.03-py3.11' }}"
-#          echo "image=${image}" >> "${GITHUB_OUTPUT}"
-#
-#      - name: Pull container image
-#        run: docker pull "${{ steps.cann-image.outputs.image }}"
-#
-#      - name: Build
-#        env:
-#          BUILD_TYPE: ${{ matrix.build }}
-#          SOC_TYPE: ascend${{ matrix.chip_type }}
-#          USE_ACL_GRAPH: ${{ matrix.use_acl_graph }}
-#        run: |
-#          HOST_UID=$(id -u)
-#          HOST_GID=$(id -g)
-#
-#          docker run --rm \
-#            -v "${PWD}:/workspace" \
-#            -w /workspace \
-#            -e SOC_TYPE=${SOC_TYPE} \
-#            -e BUILD_TYPE=${BUILD_TYPE} \
-#            -e USE_ACL_GRAPH=${USE_ACL_GRAPH} \
-#            "${{ steps.cann-image.outputs.image }}" \
-#            bash -lc '
-#              set -e
-#              yum install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs git gcc gcc-c++ make cmake openssl-devel
-#              yum clean all && rm -rf /var/cache/yum
-#              git config --global --add safe.directory "/workspace"
-#              export LD_LIBRARY_PATH=${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/$(uname -m)-linux/devlib/:${LD_LIBRARY_PATH}
-#              cmake -S . -B build \
-#                  -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
-#                  -DGGML_CANN=on \
-#                  -DSOC_TYPE=${SOC_TYPE} \
-#                  -DUSE_ACL_GRAPH=${USE_ACL_GRAPH}
-#              cmake --build build -j $(nproc)
-#
-#              chown -R '"${HOST_UID}"':'"${HOST_GID}"' /workspace/build
-#            '
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Setup CUDA Toolkit 12.4
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: "12.4.0"
+          method: "network"
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev","thrust","visual_studio_integration"]'
+
+      - name: Configure CMake
+        run: |
+          mkdir build
+          cd build
+          cmake .. `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} `
+            -DGGML_CUDA=ON `
+            -DCMAKE_CUDA_ARCHITECTURES=${{ github.event.inputs.cuda_arch }} `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_CLI=ON `
+            -DBUILD_SHARED_LIBS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ github.event.inputs.build_type }} -j 4
+
+      - name: Pack CUDA runtime DLLs
+        run: |
+          $cudaPath = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          New-Item -ItemType Directory -Force -Path cudart-pack | Out-Null
+          Copy-Item "$cudaPath\bin\cudart64_12.dll" cudart-pack\
+          Copy-Item "$cudaPath\bin\cublas64_12.dll" cudart-pack\
+          Copy-Item "$cudaPath\bin\cublasLt64_12.dll" cudart-pack\
+          Compress-Archive -Path cudart-pack\* -DestinationPath cudart-llama-bin-win-cu12.4-x64.zip -Force
+
+      - name: Upload llama-prism binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-prism-win-cuda-x64
+          path: |
+            build\bin\${{ github.event.inputs.build_type }}\llama-server.exe
+            build\bin\${{ github.event.inputs.build_type }}\llama-cli.exe
+            build\bin\${{ github.event.inputs.build_type }}\*.dll
+
+      - name: Upload CUDA runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudart-win-cuda-12.4-x64
+          path: cudart-llama-bin-win-cu12.4-x64.zip
